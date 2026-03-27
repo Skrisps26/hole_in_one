@@ -2,7 +2,7 @@
 Parameter Golf: Matching SOTA recipe exactly.
 11L d=512, 3x MLP, LeakyReLU(0.5)², XSA4, BigramHash1536, VE128,
 Partial RoPE 16/64, U-Net Skips, EMA+SWA, GPTQ-lite int6+LZMA,
-SmearGate, Legal Score-First TTT (SGD, 3ep, 32K chunks).
+SmearGate, Legal Score-First TTT (SGD, 3ep, 32K chunks)
 """
 from __future__ import annotations
 import copy,glob,io,lzma,math,os,pickle,random,subprocess,sys,time,uuid
