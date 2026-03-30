@@ -5,7 +5,7 @@ Architecture  : 11-layer GPT, dim=512, 8 heads (4 KV), MLP-3×
 Novel pieces  : WaveletGPT embedding · OptRot pre-quantisation
                 CPSVD hybrid compression · LaCT chunk-TTT at eval
 Proven stack  : partial RoPE (16/64) · LeakyReLU(0.5)² · XSA (last 4 L)
-                EMA · int6 QAT + zstd-22 · sliding-window eval (stride 64)
+                EMA · int6 QAT + zstd-22 · sliding-window eval (stride 64
 
 Expected gain vs SOTA 1.1194
   WaveletGPT   → 40-60 % faster convergence     [arXiv:2409.12924]
