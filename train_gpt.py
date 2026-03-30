@@ -2,7 +2,7 @@
 Parameter Golf: Matching SOTA recipe exactly.
 11L d=512, 3x MLP, LeakyReLU(0.5)², XSA4, BigramHash1536, VE128,
 Partial RoPE 16/64, U-Net Skips, EMA+SWA, GPTQ-lite int6+LZMA,
-SmearGate, Legal Score-First TTT (SGD, 3ep, 32K chunks)
+SmearGate, Legal Score-First TTT (SGD, 3ep, 32K chunks).
 """
 from __future__ import annotations
 import copy,glob,io,lzma,math,os,pickle,random,subprocess,sys,time,uuid
@@ -28,7 +28,7 @@ class H:
     tokenizer_path = os.environ.get("TOKENIZER_PATH","./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID",str(uuid.uuid4()))
     seed = int(os.environ.get("SEED",1337))
-    iterations = int(os.environ.get("ITERATIONS",9000))
+    iterations = int(os.environ.get("ITERATIONS",10000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS",3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS",20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS",524288))
@@ -72,10 +72,10 @@ class H:
     late_qat = int(os.environ.get("LATE_QAT",1))
     late_qat_frac = float(os.environ.get("LATE_QAT_THRESHOLD",0.15))
     ttt_enabled = int(os.environ.get("TTT_ENABLED",1))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS",3))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS",4))
     ttt_lr = float(os.environ.get("TTT_LR",0.002))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS",32768))
-    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS",32))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS",4))
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM",0.9))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP",1.0))
     eval_stride = int(os.environ.get("EVAL_STRIDE",64))
@@ -161,7 +161,7 @@ def _unpack6(data,n):
     out=torch.stack([v0,v1,v2,v3],dim=1).reshape(-1)[:n]
     return (out.to(torch.int16)-32).to(torch.int8)
 
-def quantize_state_dict(sd):
+def quantize_state_dict(sd, gptq_scales=None):
     meta,buf={},io.BytesIO()
     for k,v in sd.items():
         is_ctrl=any(p in k for p in CONTROL_PATTERNS) or v.numel()<=65536
@@ -169,7 +169,10 @@ def quantize_state_dict(sd):
             d=v.cpu().to(torch.float16).numpy().tobytes()
             meta[k]={"k":"f","s":list(v.shape),"o":buf.tell(),"n":len(d)}; buf.write(d)
         else:
-            q,s=_quant_int6_row(v.cpu())
+            if gptq_scales and k in gptq_scales:
+                q,s=gptq_scales[k]
+            else:
+                q,s=_quant_int6_row(v.cpu())
             packed,nvals=_pack6(q)
             sb=s.numpy().tobytes()
             meta[k]={"k":"q6","s":list(v.shape),"ss":list(s.shape),"nv":nvals,
@@ -190,6 +193,84 @@ def dequantize_state_dict(meta,raw):
             if s.ndim>0: sd[k]=(q.float()*s.float().view(q.shape[0],*([1]*(q.ndim-1)))).to(torch.bfloat16).view(m["s"])
             else: sd[k]=(q.float()*float(s.item())).to(torch.bfloat16).view(m["s"])
     return sd
+
+# ── GPTQ Post-Training Quantization ──────────────────────────────────────────
+def _gptq_quant_row_gpu(W, H_inv, device):
+    """GPTQ int6 with Hessian-guided column importance ordering (SpinQuant/GPTQ §4.2).
+    Sorts columns by sensitivity (smallest H_inv[i,i] = largest H[i,i] = most important)
+    so rounding errors propagate from important to unimportant columns.
+    W: [out, in] float32 on device. H_inv: [in, in] float32 on device.
+    Returns q: [out, in] int8 (CPU), scale: [out] float16 (CPU)."""
+    out_dim,in_dim=W.shape
+    # Scale fixed from original W (ensures consistency with dequantize_state_dict)
+    clip=torch.quantile(W.abs(),INT6_CLIP_Q,dim=1).clamp(min=1e-8)
+    scale=(clip/31.0).clamp(min=1.0/31.0)
+    # Importance order: smallest H_inv diag first (= most sensitive columns first)
+    order=H_inv.diag().argsort(descending=False)
+    inv_order=order.argsort()        # to restore original layout at the end
+    W_p=W[:,order].clone()           # reordered working copy
+    H_p=H_inv[order][:,order]        # H_inv reordered symmetrically
+    Q_p=torch.empty(out_dim,in_dim,dtype=torch.int8,device=device)
+    for c in range(in_dim):
+        w_col=W_p[:,c]
+        q_col=torch.clamp(torch.round(w_col/scale),-32,31).to(torch.int8)
+        Q_p[:,c]=q_col
+        if c+1<in_dim:
+            h_cc=H_p[c,c].clamp(min=1e-10)
+            err=(w_col-q_col.float()*scale)/h_cc
+            W_p[:,c+1:]-=err.unsqueeze(1)*H_p[c,c+1:].unsqueeze(0)
+    # Restore original column order before returning
+    return Q_p[:,inv_order].cpu().contiguous(), scale.cpu().to(torch.float16).contiguous()
+
+def run_gptq(gpt_model, vt, device, n_samples=256, damp=0.008):
+    """Run GPTQ on all large CastedLinear weight matrices.
+    Collects input activations via hooks, computes H=XᵀX, inverts it,
+    then quantizes each layer column-by-column with error compensation.
+    Returns gptq_scales: dict[sd_key -> (q_int8, scale_float16)]."""
+    sl=H.train_seq_len; tot=vt.numel()
+    step=max(1,(tot-sl)//n_samples)
+    starts=list(range(0,tot-sl,step))[:n_samples]
+    if not starts: return {}
+    # ── collect input activations per layer
+    hessians={}; counts={}; handles=[]
+    def make_hook(name):
+        def fn(mod,inp,out):
+            x=inp[0].detach().float().reshape(-1,inp[0].size(-1))  # [N, in]
+            xtx=x.T@x
+            if name in hessians: hessians[name]+=xtx; counts[name]+=x.size(0)
+            else: hessians[name]=xtx.clone(); counts[name]=x.size(0)
+        return fn
+    layer_map={}
+    for name,mod in gpt_model.named_modules():
+        if (isinstance(mod,CastedLinear) and mod.weight.ndim==2
+                and mod.weight.numel()>65536
+                and not any(p in name for p in CONTROL_PATTERNS)):
+            handles.append(mod.register_forward_hook(make_hook(name)))
+            layer_map[name]=mod
+    gpt_model.eval()
+    bs=8
+    with torch.no_grad():
+        for bi in range(0,len(starts),bs):
+            ba=starts[bi:bi+bs]
+            xs=torch.stack([vt[s:s+sl].to(device,dtype=torch.int64) for s in ba])
+            with torch.autocast("cuda",torch.bfloat16): gpt_model(xs)
+    for h in handles: h.remove()
+    gpt_model.train()
+    # ── GPTQ quantize each layer
+    gptq_scales={}
+    with torch.no_grad():
+        for name,mod in layer_map.items():
+            if name not in hessians: continue
+            n=counts[name]; H_mat=(hessians[name]/n).to(device)
+            dm=float(H_mat.diag().mean().item())
+            H_mat.diagonal().add_(damp*max(dm,1e-8))  # damping
+            try: H_inv=torch.linalg.inv(H_mat)
+            except Exception: del H_mat; torch.cuda.empty_cache(); continue
+            W=mod.weight.data.float().to(device)
+            q,s=_gptq_quant_row_gpu(W,H_inv,device)
+            gptq_scales[name+".weight"]=(q,s)
+            del H_mat,H_inv,W; torch.cuda.empty_cache()
+    return gptq_scales
 
 # ── Data loading & BPB ───────────────────────────────────────────────────────
 def build_sp_luts(sp,vs,dev):
@@ -360,7 +441,7 @@ class GPT(nn.Module):
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 def eval_val(mdl,rk,ws,dev,acc,vt,bb,hs,ib):
-    sl=H.train_seq_len; ls_=max(H.val_batch_size//(ws*acc*sl),1)
+    sl=H.train_seq_len; ls_=max(H.val_batch_size//(ws*sl),1)
     ts=(vt.numel()-1)//sl; s0,s1=(ts*rk)//ws,(ts*(rk+1))//ws
     ls=torch.zeros((),device=dev,dtype=torch.float64); tc=torch.zeros((),device=dev,dtype=torch.float64); bc=torch.zeros((),device=dev,dtype=torch.float64)
     mdl.eval()
@@ -397,7 +478,7 @@ def eval_sliding(mdl,rk,ws,dev,vt,bb,hs,ib,stride=64):
 # ── Legal Score-First TTT (SGD, matching SOTA) ────────────────────────────────
 def execute_ttt(base_mdl,rk,ws,dev,vt,bb,hs,ib):
     a=H; cs,stride,sl=a.ttt_chunk_tokens,a.eval_stride,a.train_seq_len
-    mdl=GPT().to(dev).bfloat16()
+    mdl=torch.compile(GPT().to(dev).bfloat16(),dynamic=False)
     raw_sd=base_mdl.state_dict()
     clean={k.replace("_orig_mod.",""):v for k,v in raw_sd.items()}
     mdl.load_state_dict(clean,strict=False); mdl.requires_grad_(True)
@@ -542,6 +623,7 @@ def main():
             with torch.autocast("cuda",torch.bfloat16): loss=model(x,y)
             tl+=loss.detach(); (loss*gs).backward()
         tl/=acc
+        torch.nn.utils.clip_grad_norm_(list(bm.parameters()),1.0)
         for o in opts: o.step(); o.zero_grad(set_to_none=True)
         # EMA update via state_dict (robust across compile)
         if a.ema_enabled:
@@ -553,7 +635,7 @@ def main():
         # Tight SWA
         if a.swa_enabled and sc<1.0:
             if not swa_started:
-                swa_sd={k:v.clone().double() for k,v in bm.state_dict().items()}; swa_count=0; swa_started=True
+                swa_sd={k:torch.zeros_like(v,dtype=torch.float64) for k,v in bm.state_dict().items()}; swa_count=0; swa_started=True
             if step%a.swa_every==0:
                 with torch.no_grad():
                     swa_count+=1
@@ -572,7 +654,7 @@ def main():
     if a.swa_enabled and swa_started and swa_count>0:
         swa_f={}
         with torch.no_grad():
-            for k in swa_sd: swa_f[k]=(swa_sd[k]/(swa_count+1)).to(bm.state_dict()[k].dtype)
+            for k in swa_sd: swa_f[k]=(swa_sd[k]/max(swa_count,1)).to(bm.state_dict()[k].dtype)
         swa_m=copy.deepcopy(bm); swa_m.load_state_dict(swa_f,strict=True)
         # Compare SWA vs EMA
         bm.load_state_dict(swa_f,strict=True)
@@ -584,10 +666,15 @@ def main():
         log(f"EMA val_loss:{ema_vl:.4f} val_bpb:{ema_vb:.4f}")
         if swa_vb<ema_vb: log("Using SWA model (better)"); eval_model=swa_m
         else: log("Using EMA model (better)")
+    # GPTQ: replace plain rounding with Hessian-compensated int6
+    log("Running GPTQ..."); torch.cuda.synchronize(); tg=time.perf_counter()
+    gptq_scales=run_gptq(eval_model,vt,dev)
+    torch.cuda.synchronize()
+    log(f"GPTQ done ({len(gptq_scales)} layers, {1000*(time.perf_counter()-tg):.0f}ms)")
     # Serialize
     log("Serializing model...")
     sd={k.replace("_orig_mod.",""):v for k,v in eval_model.state_dict().items()}
-    meta,raw=quantize_state_dict(sd); compressed=compress_bytes(raw)
+    meta,raw=quantize_state_dict(sd,gptq_scales); compressed=compress_bytes(raw)
     payload=pickle.dumps({"m":meta,"c":compressed})
     if master:
         Path("final_model.ptz").write_bytes(payload); cb=len(code.encode("utf-8"))
