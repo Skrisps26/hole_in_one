@@ -345,7 +345,7 @@ class CausalSelfAttention(nn.Module):
         self.out_proj= QATLinear(D, D,            bias=False)
 
         self.q_gain  = nn.Parameter(torch.full((H,), args.qk_gain_init))
-        self.resid_mix = nn.Parameter(torch.ones(1))   # learnable residual blend
+        x = x + self.resid_mix * self.attn(self.norm1(x), cos, sin)  # learnable residual blend
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         B, T, D = x.shape
