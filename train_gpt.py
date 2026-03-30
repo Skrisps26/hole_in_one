@@ -143,7 +143,7 @@ class Muon(torch.optim.Optimizer):
             updates_flat = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
             curr = 0
             for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
+                if p.grad is not None:
                     g = p.grad
                     if wd != 0.0:
                         g = g.add(p.data, alpha=wd)
