@@ -1184,9 +1184,9 @@ def train(args: Hyperparameters):
 
     # ── model ──────────────────────────────────────────────────
     model = GPT(args).to(device)
-    model = torch.compile(model)
     model = DDP(model, device_ids=[rank])
     raw   = model.module
+    model = torch.compile(model, dynamic=False)  # compile after DDP
 
     # Count params
     n_params = sum(p.numel() for p in raw.parameters())
@@ -1248,15 +1248,21 @@ def train(args: Hyperparameters):
 
     def next_batch() -> tuple[Tensor, Tensor]:
         nonlocal shard_idx, shard_pos, shard_data
-        if shard_data is None or shard_pos + local_batch_seqs * seq_len + 1 > len(shard_data):
-            shard_data = load_data_shard(Path(train_files[shard_idx % len(train_files)])).to(device)
+        # Need enough tokens for ALL ranks in this microstep:
+        # world_size * local_batch_seqs * seq_len + 1 (for the +1 target shift)
+        tokens_needed = world_size * local_batch_seqs * seq_len + 1
+        if shard_data is None or shard_pos + tokens_needed > len(shard_data):
+            shard_data = load_data_shard(
+                Path(train_files[shard_idx % len(train_files)])
+            ).to(device)
             shard_idx += 1
             shard_pos  = 0
+        # Each rank gets a non-overlapping window within this microstep's block
         start = shard_pos + rank * local_batch_seqs * seq_len
         end   = start + local_batch_seqs * seq_len + 1
         chunk = shard_data[start:end].long()
-        x = chunk[:-1].view(local_batch_seqs, seq_len)
-        y = chunk[1: ].view(local_batch_seqs, seq_len)
+        x = chunk[:-1].reshape(local_batch_seqs, seq_len)
+        y = chunk[1: ].reshape(local_batch_seqs, seq_len)
         shard_pos += world_size * local_batch_seqs * seq_len
         return x, y
 
@@ -1270,7 +1276,7 @@ def train(args: Hyperparameters):
     model.train()
 
     for step in range(args.iterations):
-        # ── wall-clock cap ────────────────────────────────────
+        # ── wall-clock cap + elapsed ──────────────────────────
         elapsed = time.time() - t0
         if elapsed > args.max_wallclock_seconds:
             if master:
@@ -1278,6 +1284,7 @@ def train(args: Hyperparameters):
             break
 
         # ── LR schedule ───────────────────────────────────────
+        frac = elapsed / args.max_wallclock_seconds
         lr_m = get_lr_schedule(step, args.iterations, args.warmup_steps,
                                 args.warmdown_iters, args.matrix_lr)
         lr_s = get_lr_schedule(step, args.iterations, args.warmup_steps,
@@ -1291,7 +1298,7 @@ def train(args: Hyperparameters):
         adam_opt.param_groups[1]["lr"] = lr_e
 
         # ── QAT activation ────────────────────────────────────
-        if not qat_started and elapsed / args.max_wallclock_seconds >= args.qat_start_frac:
+        if not qat_started and frac >= args.qat_start_frac:
             raw.enable_qat()
             qat_started = True
             if master:
