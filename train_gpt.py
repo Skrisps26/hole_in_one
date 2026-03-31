@@ -124,13 +124,14 @@ class Block(nn.Module):
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.emb = nn.Embedding(VOCAB, DIM)
+        self.emb1 = nn.Embedding(VOCAB, 128)
+        self.emb2 = nn.Linear(128, DIM, bias=False)
         self.blocks = nn.ModuleList([Block() for _ in range(LAYERS)])
         self.ln = nn.RMSNorm(DIM)
         self.head = nn.Linear(DIM, VOCAB, bias=False)
 
     def forward(self, x, y=None):
-        x = self.emb(x)
+        x = self.emb2(self.emb1(x))
         for b in self.blocks:
             x = b(x)
         x = self.ln(x)
@@ -189,6 +190,8 @@ def train():
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+        for p in model.parameters():
+            p.data.clamp_(-3, 3)
 
         step_time = (time.perf_counter() - t0) * 1000
         total_time += step_time
@@ -204,25 +207,73 @@ def train():
 # COMPRESS
 # =============================
 def compress(model):
+    import lzma
     out = {}
-    for n,p in model.state_dict().items():
+
+    def quantize(W, bits=5, group=64):
+        # log domain
+        W = torch.sign(W) * torch.log1p(W.abs())
+
+        levels = 2**bits - 1
+        W = W.view(W.shape[0], -1)
+
+        q_chunks = []
+        for i in range(0, W.shape[1], group):
+            chunk = W[:, i:i+group]
+            scale = chunk.abs().max(dim=1, keepdim=True)[0] + 1e-8
+            q = torch.round(chunk / scale * (levels//2))
+            q_chunks.append(q)
+
+        return torch.cat(q_chunks, dim=1).to(torch.int8)
+
+    for name, p in model.state_dict().items():
         W = p.float()
 
-        if W.ndim == 2:
-            scale = W.abs().max(dim=1, keepdim=True)[0] + 1e-8
-            q = torch.round(W/scale*15).to(torch.int8)
-
-            q = (q+16).cpu().numpy().astype(np.uint8).flatten()
-            if q.size % 2:
-                q = np.append(q,0)
-
-            packed = (q[0::2] | (q[1::2]<<5)).astype(np.uint16)
-            out[n] = zlib.compress(packed.tobytes(), 9)
+        # mixed precision
+        if "head" in name:
+            bits = 6
+        elif "blocks.7" in name or "blocks.8" in name:
+            bits = 6
+        elif "blocks.0" in name or "blocks.1" in name:
+            bits = 4
         else:
-            out[n] = zlib.compress(W.half().cpu().numpy().tobytes(), 9)
+            bits = 5
+
+        if W.ndim == 2:
+            q = quantize(W, bits=bits)
+
+            # shift to positive
+            q = (q + (2**(bits-1))).cpu().numpy().astype(np.uint8)
+
+            # flatten
+            q = q.flatten()
+
+            # better entropy coding
+            compressed = lzma.compress(q.tobytes())
+
+            out[name] = compressed
+        else:
+            out[name] = lzma.compress(W.half().cpu().numpy().tobytes())
 
     return out
 
+def gptq_lite(model):
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() != 2:
+                continue
+
+            # only important layers
+            if not ("blocks.7" in name or "blocks.8" in name or "head" in name):
+                continue
+
+            W = p.data
+
+            # simple Hessian approx via variance
+            scale = W.pow(2).mean(dim=1, keepdim=True).sqrt() + 1e-6
+
+            q = torch.round(W / scale * 7)  # ~int4/5 hybrid
+            p.data.copy_(q * scale)
 # =============================
 # RUN
 # =============================
@@ -232,7 +283,7 @@ if __name__ == "__main__":
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
         print("val_bpb:", evaluate(m, loader))
-
+        gptq_lite(m)
         art = compress(m)
         print("size:", sum(len(v) for v in art.values()))
     dist.destroy_process_group()
