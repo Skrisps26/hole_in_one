@@ -253,9 +253,9 @@ def train():
 
     ema.apply(model.module)
     if rank == 0:
-    val_loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
-    val_bpb = evaluate(model.module, val_loader)
-    print("val_bpb:", val_bpb)
+        val_loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
+        val_bpb = evaluate(model.module, val_loader)
+        print("val_bpb:", val_bpb)
     return model.module
 
 # =============================
