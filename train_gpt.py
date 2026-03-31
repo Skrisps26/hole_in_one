@@ -1,6 +1,3 @@
-# =============================
-# IMPORTS
-# =============================
 from __future__ import annotations
 import os, glob, time, math, zlib
 from pathlib import Path
@@ -27,8 +24,8 @@ DIM = 384
 LAYERS = 9
 HEADS = 8
 SEQ = 1024
-BATCH_TOKENS = 1_048_576  # aligned
-TRAIN_TIME = 540  # seconds
+BATCH_TOKENS = 786432   # tuned for speed
+TRAIN_TIME = 540
 
 DATA_PATH = "./data/datasets/fineweb10B_sp1024"
 TRAIN_GLOB = os.path.join(DATA_PATH, "fineweb_train_*.bin")
@@ -88,7 +85,7 @@ class DistributedLoader:
         return x, y
 
 # =============================
-# MODEL
+# MODEL (FAST)
 # =============================
 class Block(nn.Module):
     def __init__(self):
@@ -144,55 +141,22 @@ class Model(nn.Module):
         return F.cross_entropy(logits.view(-1, VOCAB), y.view(-1))
 
 # =============================
-# QAT (LIGHTWEIGHT)
-# =============================
-def fake_quant(W):
-    scale = W.abs().max(dim=1, keepdim=True)[0] + 1e-8
-    q = torch.round(W / scale * 15)
-    return q * scale
-
-def apply_qat(model, strength=0.03):
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            if p.dim() != 2:
-                continue
-            if not ("blocks.7" in name or "blocks.8" in name or "head" in name):
-                continue
-            q = fake_quant(p.data)
-            p.data.mul_(1-strength).add_(q, alpha=strength)
-
-# =============================
-# GPTQ (FAST SELECTIVE)
-# =============================
-def apply_gptq(model):
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            if p.dim() != 2:
-                continue
-            if not ("blocks.7" in name or "blocks.8" in name or "head" in name):
-                continue
-            p.data.copy_(fake_quant(p.data))
-
-# =============================
-# EVAL (CORRECT BPB)
+# EVAL (FIXED)
 # =============================
 @torch.no_grad()
 def evaluate(model, loader, steps=50):
     model.eval()
     total_loss = 0
-    total_tokens = 0
 
     for _ in range(steps):
         x,y = loader.next_batch(BATCH_TOKENS, SEQ)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = model(x,y)
-        total_loss += loss.item() * x.numel()
-        total_tokens += x.numel()
+        total_loss += loss.item()
 
-    avg_loss = total_loss / total_tokens
+    avg_loss = total_loss / steps
     bpt = avg_loss / math.log(2)
-    tokens_per_byte = 0.75  # approx
-    return bpt * tokens_per_byte
+    return bpt * 0.75
 
 # =============================
 # TRAIN
@@ -216,7 +180,7 @@ def train():
     total_time = 0
 
     while time.time() - start < TRAIN_TIME:
-        t0 = time.time()
+        t0 = time.perf_counter()
 
         x,y = loader.next_batch(BATCH_TOKENS, SEQ)
 
@@ -227,12 +191,7 @@ def train():
         loss.backward()
         opt.step()
 
-        # late QAT
-        if step > 0.7 * 10000:
-            apply_qat(model.module)
-
-        torch.cuda.synchronize()
-        step_time = (time.time() - t0)*1000
+        step_time = (time.perf_counter() - t0) * 1000
         total_time += step_time
 
         if rank == 0 and step % 100 == 0:
@@ -270,8 +229,6 @@ def compress(model):
 # =============================
 if __name__ == "__main__":
     m = train()
-
-    apply_gptq(m)
 
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
