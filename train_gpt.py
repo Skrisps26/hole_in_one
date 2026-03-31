@@ -178,9 +178,8 @@ def train():
     start = time.time()
     step = 0
     total_time = 0
-
-    while time.time() - start < TRAIN_TIME:
-        t0 = time.perf_counter()
+    MAX_STEPS = 8000
+    for step in range(MAX_STEPS):
 
         x,y = loader.next_batch(BATCH_TOKENS, SEQ)
 
@@ -229,7 +228,7 @@ def compress(model):
 # =============================
 if __name__ == "__main__":
     m = train()
-    dist.barrier()
+    
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
         print("val_bpb:", evaluate(m, loader))
