@@ -229,10 +229,11 @@ def compress(model):
 # =============================
 if __name__ == "__main__":
     m = train()
-
+    dist.barrier()
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
         print("val_bpb:", evaluate(m, loader))
 
         art = compress(m)
         print("size:", sum(len(v) for v in art.values()))
+    dist.destroy_process_group()
