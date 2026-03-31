@@ -304,6 +304,7 @@ def compress(model):
             q = torch.round(W/scale*15).to(torch.int8)
 
             q = (q+16).cpu().numpy().astype(np.uint8)
+            q = q.flatten()
             if len(q)%2: q = np.append(q,0)
 
             packed = (q[0::2] | (q[1::2]<<5)).astype(np.uint16)
