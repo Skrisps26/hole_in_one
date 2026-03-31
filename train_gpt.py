@@ -65,7 +65,32 @@ class TokenStream:
             n -= k
         return torch.cat(out)
 
+@torch.no_grad()
+def evaluate(model, loader, steps=50):
+    model.eval()
+    total_loss = 0
+    total_tokens = 0
 
+    for _ in range(steps):
+        x, y = loader.next_batch(BATCH_TOKENS, SEQ)
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(x, y)
+
+        total_loss += loss.item() * x.numel()
+        total_tokens += x.numel()
+
+    model.train()
+
+    avg_loss = total_loss / total_tokens
+
+    # convert CE → bits per token
+    bpt = avg_loss / math.log(2)
+
+    # dataset specific (fineweb ~0.75 bytes/token)
+    bpb = bpt * 0.75
+
+    return bpb
 class DistributedLoader:
     def __init__(self, pattern, rank, world, device):
         self.rank = rank
@@ -209,8 +234,10 @@ def train():
     ema = EMA(model.module)
 
     loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
-
-    for step in range(STEPS):
+    start = time.time()
+    step = 0
+    while time.time() - start < 540:
+        step += 1
         x, y = loader.next_batch(BATCH_TOKENS, SEQ)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -225,6 +252,10 @@ def train():
             print(step, loss.item())
 
     ema.apply(model.module)
+    if rank == 0:
+    val_loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
+    val_bpb = evaluate(model.module, val_loader)
+    print("val_bpb:", val_bpb)
     return model.module
 
 # =============================
@@ -308,7 +339,8 @@ def compress(model):
             if len(q)%2: q = np.append(q,0)
 
             packed = (q[0::2] | (q[1::2]<<5)).astype(np.uint16)
-            out[n] = packed.tobytes()
+            compressed = zlib.compress(packed.tobytes(), level=9)
+            out[n] = compressed
         else:
             out[n] = W.half().cpu().numpy().tobytes()
 
