@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, glob, time, math, lzma
+import os, glob, time, math, lzma, copy
 from pathlib import Path
 
 import torch
@@ -10,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 
 # =============================
-# SPEED SETTINGS
+# SPEED
 # =============================
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -20,9 +20,10 @@ torch.set_float32_matmul_precision("high")
 # CONFIG
 # =============================
 VOCAB = 1024
-DIM = 384
-LAYERS = 9
+DIM = 512
+LAYERS = 11
 HEADS = 8
+KV_HEADS = 4
 SEQ = 1024
 BATCH_TOKENS = 786432
 MAX_STEPS = 9000
@@ -31,7 +32,7 @@ DATA_PATH = "./data/datasets/fineweb10B_sp1024"
 TRAIN_GLOB = os.path.join(DATA_PATH, "fineweb_train_*.bin")
 
 # =============================
-# DATA LOADER
+# DATA
 # =============================
 def load_data_shard(file: Path):
     header = np.fromfile(file, dtype="<i4", count=256)
@@ -93,7 +94,8 @@ class Block(nn.Module):
         self.ln1 = nn.RMSNorm(DIM)
         self.ln2 = nn.RMSNorm(DIM)
 
-        self.qkv = nn.Linear(DIM, 3*DIM, bias=False)
+        self.q = nn.Linear(DIM, DIM, bias=False)
+        self.kv = nn.Linear(DIM, DIM, bias=False)
         self.proj = nn.Linear(DIM, DIM, bias=False)
 
         self.ff = nn.Sequential(
@@ -102,24 +104,31 @@ class Block(nn.Module):
             nn.Linear(4*DIM, DIM)
         )
 
-    def forward(self, x):
+    def forward(self, x, shared_kv=None):
         B,T,D = x.shape
         h = HEADS
+        kv_h = KV_HEADS
         d = D // h
 
-        qkv = self.qkv(self.ln1(x))
-        q,k,v = qkv.chunk(3, dim=-1)
+        q = self.q(self.ln1(x))
+
+        kv = self.kv(x) if shared_kv is None else shared_kv
+        k,v = kv.chunk(2, dim=-1)
 
         q = q.view(B,T,h,d).transpose(1,2)
-        k = k.view(B,T,h,d).transpose(1,2)
-        v = v.view(B,T,h,d).transpose(1,2)
+        k = k.view(B,T,kv_h,d).transpose(1,2)
+        v = v.view(B,T,kv_h,d).transpose(1,2)
+
+        k = k.repeat_interleave(h // kv_h, dim=1)
+        v = v.repeat_interleave(h // kv_h, dim=1)
 
         y = F.scaled_dot_product_attention(q,k,v,is_causal=True)
         y = y.transpose(1,2).reshape(B,T,D)
 
         x = x + self.proj(y)
         x = x + self.ff(self.ln2(x))
-        return x
+        return x, kv
+
 
 class Model(nn.Module):
     def __init__(self):
@@ -131,8 +140,11 @@ class Model(nn.Module):
 
     def forward(self, x, y=None):
         x = self.emb(x)
-        for b in self.blocks:
-            x = b(x)
+        shared_kv = None
+
+        for i, b in enumerate(self.blocks):
+            x, shared_kv = b(x, shared_kv if i > 0 else None)
+
         x = self.ln(x)
         logits = self.head(x)
 
@@ -154,6 +166,8 @@ def train():
     model = Model().to(device)
     model = DDP(model, device_ids=[rank], static_graph=True)
 
+    ema_model = copy.deepcopy(model.module).to(device).eval()
+
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
     loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
 
@@ -171,8 +185,13 @@ def train():
         loss.backward()
         opt.step()
 
-        # clamp (important for compression)
-        for p in model.parameters():
+        # EMA
+        with torch.no_grad():
+            for p, ema_p in zip(model.module.parameters(), ema_model.parameters()):
+                ema_p.data.mul_(0.997).add_(p.data, alpha=0.003)
+
+        # clamp
+        for p in model.module.parameters():
             p.data.clamp_(-3, 3)
 
         step_time = (time.perf_counter() - t0) * 1000
@@ -181,13 +200,13 @@ def train():
         if rank == 0 and step % 100 == 0:
             print(f"{step} loss={loss.item():.3f} step={step_time:.2f}ms avg={total_time/(step+1):.2f}ms")
 
-    return model.module
+    return ema_model
 
 # =============================
-# EVAL (CLEAN)
+# EVAL
 # =============================
 @torch.no_grad()
-def evaluate(model, loader, steps=50):
+def evaluate(model, loader, steps=100):
     model.eval()
     total_loss = 0
 
@@ -197,8 +216,18 @@ def evaluate(model, loader, steps=50):
             loss = model(x,y)
         total_loss += loss.item()
 
-    avg_loss = total_loss / steps
-    return (avg_loss / math.log(2)) * 0.75
+    return (total_loss / steps) / math.log(2) * 0.75
+
+# =============================
+# CALIBRATION
+# =============================
+@torch.no_grad()
+def generate_calib(model, loader, steps=32):
+    xs = []
+    for _ in range(steps):
+        x,_ = loader.next_batch(BATCH_TOKENS, SEQ)
+        xs.append(x)
+    return torch.cat(xs, dim=0)
 
 # =============================
 # GPTQ-LITE
@@ -208,8 +237,6 @@ def gptq_lite(model):
         for name, p in model.named_parameters():
             if p.dim() != 2:
                 continue
-            if not ("blocks.7" in name or "blocks.8" in name or "head" in name):
-                continue
 
             W = p.data
             scale = W.abs().mean(dim=1, keepdim=True) + 1e-6
@@ -217,7 +244,7 @@ def gptq_lite(model):
             p.data.copy_(q * scale)
 
 # =============================
-# COMPRESSION
+# COMPRESS
 # =============================
 def compress(model):
     out = {}
@@ -226,14 +253,11 @@ def compress(model):
         W = p.float()
 
         if W.ndim == 2:
-            # log transform
             W = torch.sign(W) * torch.log1p(W.abs())
-
             scale = W.abs().max(dim=1, keepdim=True)[0] + 1e-8
             q = torch.round(W / scale * 15).to(torch.int8)
 
             q = (q + 16).cpu().numpy().astype(np.uint8).flatten()
-
             out[name] = lzma.compress(q.tobytes())
         else:
             out[name] = lzma.compress(W.half().cpu().numpy().tobytes())
@@ -248,11 +272,12 @@ if __name__ == "__main__":
 
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
+
         print("val_bpb:", evaluate(m, loader))
 
         gptq_lite(m)
-
         art = compress(m)
+
         print("size:", sum(len(v) for v in art.values()))
 
     dist.destroy_process_group()
