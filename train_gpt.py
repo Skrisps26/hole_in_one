@@ -180,7 +180,7 @@ def train():
     total_time = 0
     MAX_STEPS = 8000
     for step in range(MAX_STEPS):
-
+        t0 = time.perf_counter()
         x,y = loader.next_batch(BATCH_TOKENS, SEQ)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
