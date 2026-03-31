@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, glob, time, math, zlib
+import os, glob, time, math, lzma
 from pathlib import Path
 
 import torch
@@ -10,7 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 
 # =============================
-# SPEED
+# SPEED SETTINGS
 # =============================
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -24,8 +24,8 @@ DIM = 384
 LAYERS = 9
 HEADS = 8
 SEQ = 1024
-BATCH_TOKENS = 786432   # tuned for speed
-TRAIN_TIME = 540
+BATCH_TOKENS = 786432
+MAX_STEPS = 9000
 
 DATA_PATH = "./data/datasets/fineweb10B_sp1024"
 TRAIN_GLOB = os.path.join(DATA_PATH, "fineweb_train_*.bin")
@@ -85,7 +85,7 @@ class DistributedLoader:
         return x, y
 
 # =============================
-# MODEL (FAST)
+# MODEL
 # =============================
 class Block(nn.Module):
     def __init__(self):
@@ -124,14 +124,13 @@ class Block(nn.Module):
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.emb1 = nn.Embedding(VOCAB, 128)
-        self.emb2 = nn.Linear(128, DIM, bias=False)
+        self.emb = nn.Embedding(VOCAB, DIM)
         self.blocks = nn.ModuleList([Block() for _ in range(LAYERS)])
         self.ln = nn.RMSNorm(DIM)
         self.head = nn.Linear(DIM, VOCAB, bias=False)
 
     def forward(self, x, y=None):
-        x = self.emb2(self.emb1(x))
+        x = self.emb(x)
         for b in self.blocks:
             x = b(x)
         x = self.ln(x)
@@ -140,24 +139,6 @@ class Model(nn.Module):
         if y is None:
             return logits
         return F.cross_entropy(logits.view(-1, VOCAB), y.view(-1))
-
-# =============================
-# EVAL (FIXED)
-# =============================
-@torch.no_grad()
-def evaluate(model, loader, steps=50):
-    model.eval()
-    total_loss = 0
-
-    for _ in range(steps):
-        x,y = loader.next_batch(BATCH_TOKENS, SEQ)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = model(x,y)
-        total_loss += loss.item()
-
-    avg_loss = total_loss / steps
-    bpt = avg_loss / math.log(2)
-    return bpt * 0.75
 
 # =============================
 # TRAIN
@@ -173,15 +154,14 @@ def train():
     model = Model().to(device)
     model = DDP(model, device_ids=[rank], static_graph=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
     loader = DistributedLoader(TRAIN_GLOB, rank, world, device)
 
-    start = time.time()
-    step = 0
     total_time = 0
-    MAX_STEPS = 8000
+
     for step in range(MAX_STEPS):
         t0 = time.perf_counter()
+
         x,y = loader.next_batch(BATCH_TOKENS, SEQ)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -190,6 +170,8 @@ def train():
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
+
+        # clamp (important for compression)
         for p in model.parameters():
             p.data.clamp_(-3, 3)
 
@@ -199,91 +181,78 @@ def train():
         if rank == 0 and step % 100 == 0:
             print(f"{step} loss={loss.item():.3f} step={step_time:.2f}ms avg={total_time/(step+1):.2f}ms")
 
-        step += 1
-
     return model.module
 
 # =============================
-# COMPRESS
+# EVAL (CLEAN)
 # =============================
-def compress(model):
-    import lzma
-    out = {}
+@torch.no_grad()
+def evaluate(model, loader, steps=50):
+    model.eval()
+    total_loss = 0
 
-    def quantize(W, bits=5, group=64):
-        # log domain
-        W = torch.sign(W) * torch.log1p(W.abs())
+    for _ in range(steps):
+        x,y = loader.next_batch(BATCH_TOKENS, SEQ)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = model(x,y)
+        total_loss += loss.item()
 
-        levels = 2**bits - 1
-        W = W.view(W.shape[0], -1)
+    avg_loss = total_loss / steps
+    return (avg_loss / math.log(2)) * 0.75
 
-        q_chunks = []
-        for i in range(0, W.shape[1], group):
-            chunk = W[:, i:i+group]
-            scale = chunk.abs().max(dim=1, keepdim=True)[0] + 1e-8
-            q = torch.round(chunk / scale * (levels//2))
-            q_chunks.append(q)
-
-        return torch.cat(q_chunks, dim=1).to(torch.int8)
-
-    for name, p in model.state_dict().items():
-        W = p.float()
-
-        # mixed precision
-        if "head" in name:
-            bits = 6
-        elif "blocks.7" in name or "blocks.8" in name:
-            bits = 6
-        elif "blocks.0" in name or "blocks.1" in name:
-            bits = 4
-        else:
-            bits = 5
-
-        if W.ndim == 2:
-            q = quantize(W, bits=bits)
-
-            # shift to positive
-            q = (q + (2**(bits-1))).cpu().numpy().astype(np.uint8)
-
-            # flatten
-            q = q.flatten()
-
-            # better entropy coding
-            compressed = lzma.compress(q.tobytes())
-
-            out[name] = compressed
-        else:
-            out[name] = lzma.compress(W.half().cpu().numpy().tobytes())
-
-    return out
-
+# =============================
+# GPTQ-LITE
+# =============================
 def gptq_lite(model):
     with torch.no_grad():
         for name, p in model.named_parameters():
             if p.dim() != 2:
                 continue
-
-            # only important layers
             if not ("blocks.7" in name or "blocks.8" in name or "head" in name):
                 continue
 
             W = p.data
-
-            # simple Hessian approx via variance
-            scale = W.pow(2).mean(dim=1, keepdim=True).sqrt() + 1e-6
-
-            q = torch.round(W / scale * 7)  # ~int4/5 hybrid
+            scale = W.abs().mean(dim=1, keepdim=True) + 1e-6
+            q = torch.round(W / scale * 7)
             p.data.copy_(q * scale)
+
+# =============================
+# COMPRESSION
+# =============================
+def compress(model):
+    out = {}
+
+    for name, p in model.state_dict().items():
+        W = p.float()
+
+        if W.ndim == 2:
+            # log transform
+            W = torch.sign(W) * torch.log1p(W.abs())
+
+            scale = W.abs().max(dim=1, keepdim=True)[0] + 1e-8
+            q = torch.round(W / scale * 15).to(torch.int8)
+
+            q = (q + 16).cpu().numpy().astype(np.uint8).flatten()
+
+            out[name] = lzma.compress(q.tobytes())
+        else:
+            out[name] = lzma.compress(W.half().cpu().numpy().tobytes())
+
+    return out
+
 # =============================
 # RUN
 # =============================
 if __name__ == "__main__":
     m = train()
-    
+
     if dist.get_rank() == 0:
         loader = DistributedLoader(TRAIN_GLOB, 0, dist.get_world_size(), torch.device("cuda:0"))
         print("val_bpb:", evaluate(m, loader))
+
         gptq_lite(m)
+
         art = compress(m)
         print("size:", sum(len(v) for v in art.values()))
+
     dist.destroy_process_group()
