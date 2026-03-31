@@ -322,8 +322,7 @@ class HyperConnection(nn.Module):
 class CausalSelfAttention(nn.Module):
     """
     Multi-head GQA attention with:
-    - XSA: remove value self-contribution (all 11 layers)
-    - Value Residual Learning (VRL): inject value from layer-0 into every layer
+    - Value Residual Learning (VRL): layer-0 v injected into all layers
     - Partial RoPE (rope_dims of head_dim)
     - Per-layer learned LN scale (qk_scale)
     """
@@ -336,59 +335,57 @@ class CausalSelfAttention(nn.Module):
         self.head_dim     = model_dim // num_heads
         self.rope_dims    = rope_dims
         self.layer_idx    = layer_idx
+        self.is_first     = (layer_idx == 0)
 
-        self.qkv   = nn.Linear(model_dim, (num_heads + 2 * num_kv_heads) * self.head_dim, bias=False)
-        self.proj  = nn.Linear(model_dim, model_dim, bias=False)
+        self.qkv  = nn.Linear(model_dim, (num_heads + 2 * num_kv_heads) * self.head_dim, bias=False)
+        self.proj = nn.Linear(model_dim, model_dim, bias=False)
 
-        # VRL: learned blend of layer-0 value and current value
-        # (layer-0 has no vrl_alpha, it defines v0)
-        if layer_idx > 0:
-            self.vrl_alpha = nn.Parameter(torch.full((num_heads,), 0.1))
+        # VRL: ALL layers get vrl_alpha; layer-0's alpha is frozen at 0
+        # so it always outputs its own v (no blending). This avoids
+        # a Python if/else branch inside the graph.
+        self.vrl_alpha = nn.Parameter(torch.zeros(num_heads))
+        if layer_idx == 0:
+            self.vrl_alpha.requires_grad_(False)  # layer-0 anchor, not trained
 
-        # Per-layer attention scale (LN Scale)
+        # Per-head QK scale (LN Scale)
         self.qk_scale = nn.Parameter(torch.ones(num_heads))
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
-                v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+                v0: Tensor) -> tuple[Tensor, Tensor]:
         B, T, D = x.shape
         nH, nKV, hd = self.num_heads, self.num_kv_heads, self.head_dim
 
-        qkv   = self.qkv(x)                                    # [B, T, (nH+2*nKV)*hd]
-        q_raw = qkv[..., :nH * hd].view(B, T, nH, hd)         # [B, T, nH, hd]
+        qkv   = self.qkv(x)
+        q_raw = qkv[..., :nH * hd].view(B, T, nH, hd)
         k_raw = qkv[..., nH*hd:(nH+nKV)*hd].view(B, T, nKV, hd)
         v_raw = qkv[..., (nH+nKV)*hd:].view(B, T, nKV, hd)
 
-        # ── Partial RoPE ─────────────────────────────────────
-        # Transpose to [B, nH, T, hd] for RoPE, then back
+        # ── Partial RoPE ──────────────────────────────────────
         q_t = apply_rope(q_raw.permute(0, 2, 1, 3), cos, sin)   # [B,nH,T,hd]
         k_t = apply_rope(k_raw.permute(0, 2, 1, 3), cos, sin)   # [B,nKV,T,hd]
 
         # ── GQA: repeat KV heads ──────────────────────────────
         reps  = nH // nKV
-        k_exp = k_t.repeat_interleave(reps, dim=1)   # [B, nH, T, hd]
+        k_exp = k_t.repeat_interleave(reps, dim=1)
         v_exp = v_raw.permute(0, 2, 1, 3).repeat_interleave(reps, dim=1)  # [B,nH,T,hd]
 
-        # ── Value Residual Learning (VRL) ─────────────────────
-        if self.layer_idx == 0:
-            v0_out = v_exp.detach()           # store for subsequent layers
-        else:
-            alpha = self.vrl_alpha.sigmoid()  # [nH]
-            # blend: (1-α)·v_current + α·v0
-            v_exp = (1.0 - alpha)[None, :, None, None] * v_exp \
-                  + alpha[None, :, None, None]          * v0
-            v0_out = v0                        # pass through unchanged
+        # ── VRL: blend current v with layer-0 anchor v0 ───────
+        # alpha=0 for layer-0 (frozen) → pure v_exp, v0_out = v_exp
+        # alpha>0 for layer>0         → (1-α)·v_exp + α·v0
+        alpha = self.vrl_alpha.sigmoid()[None, :, None, None]   # [1,nH,1,1]
+        v_blend = (1.0 - alpha) * v_exp + alpha * v0
+        # layer-0 updates the anchor; others pass it through
+        v0_out = v_exp if self.is_first else v0
 
-        # ── QK scale (LN Scale per head) ─────────────────────
-        scale = self.qk_scale[None, :, None, None]   # [1,nH,1,1]
-        q_scaled = q_t * (scale * hd ** -0.5).sqrt()
-        k_scaled = k_exp * (scale * hd ** -0.5).sqrt()
+        # ── QK scale ─────────────────────────────────────────
+        scale = self.qk_scale[None, :, None, None]
+        q_s = q_t * (scale * hd ** -0.5).sqrt()
+        k_s = k_exp * (scale * hd ** -0.5).sqrt()
 
-        # ── Causal SDPA (FlashAttention-3 via torch backend) ─
-        y = F.scaled_dot_product_attention(
-            q_scaled, k_scaled, v_exp, is_causal=True
-        )                                                        # [B, nH, T, hd]
+        # ── Causal SDPA ───────────────────────────────────────
+        y = F.scaled_dot_product_attention(q_s, k_s, v_blend, is_causal=True)
 
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T, D)   # [B, T, D]
+        y   = y.permute(0, 2, 1, 3).contiguous().view(B, T, D)
         out = self.proj(y)
         return out, v0_out
 
@@ -441,7 +438,7 @@ class Block(nn.Module):
         self.hc_mlp  = HyperConnection(hc_n)
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
-                v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+                v0: Tensor) -> tuple[Tensor, Tensor]:
         attn_out, v0_out = self.attn(self.norm1(x), cos, sin, v0)
         x = self.hc_attn(x, attn_out)
         x = self.hc_mlp(x, self.mlp(self.norm2(x)))
@@ -511,24 +508,20 @@ class GPT(nn.Module):
             self._rope_seq_len = T
 
     def _qat_quantise(self, w: Tensor) -> Tensor:
-        """Straight-through estimator int-N quantisation."""
-        bits = self.qat_bits
-        levels = 2 ** bits - 1
-        with torch.no_grad():
-            scale = w.abs().max().clamp(min=1e-8)
-        w_scaled = w / scale
-        w_clamped = w_scaled.clamp(-1, 1)
-        w_q = torch.round(w_clamped * (levels / 2)) / (levels / 2)
-        # STE: pass gradient through threshold
-        threshold = self.qat_threshold
-        w_q = w_clamped + (w_q - w_clamped).detach() * (w_scaled.abs() <= threshold).float()
-        return w_q * scale
-
-    def _forward_with_qat(self, module: nn.Linear) -> Tensor:
-        """Apply QAT to weight if enabled."""
-        if self.qat_enabled and module.weight.requires_grad:
-            return self._qat_quantise(module.weight)
-        return module.weight
+        """
+        Straight-through estimator int-N quantisation.
+        No torch.no_grad() — scale computed with stop_gradient via .detach().
+        """
+        levels = 2 ** self.qat_bits - 1
+        half   = levels / 2
+        # Use detach for scale so it doesn't appear in the graph as a learnable quantity
+        scale  = w.detach().abs().max().clamp(min=1e-8)
+        w_norm = w / scale
+        w_q    = torch.round(w_norm.clamp(-1, 1) * half) / half
+        # STE: straight-through where |w| > threshold, quantised elsewhere
+        mask   = (w_norm.detach().abs() <= self.qat_threshold).float()
+        w_out  = w_norm + (w_q - w_norm).detach() * mask
+        return w_out * scale
 
     def enable_qat(self):
         self.qat_enabled = True
@@ -537,41 +530,38 @@ class GPT(nn.Module):
         B, T = x.shape
         device = x.device
         self._ensure_rope(T, device)
-        cos = self.rope_cos[:T]   # [T, rope_dims//2]
+        cos = self.rope_cos[:T]
         sin = self.rope_sin[:T]
 
-        # ── token embedding ────────────────────────────────────
-        tok_emb = self.embed(x)                   # [B, T, D]
-
-        # ── WaveletGPT: Haar wavelet on embedding dims ─────────
+        # ── Embedding + wavelet ────────────────────────────────
+        tok_emb = self.embed(x)
         if self.args.use_wavelet_embed:
             tok_emb = haar_wavelet_transform(tok_emb)
-
-        # ── SmearGate bigram injection ─────────────────────────
         tok_emb = tok_emb + self.bigram(x)
 
-        h = tok_emb
-        v0: Tensor | None = None
+        # ── Transformer blocks ────────────────────────────────
+        # v0 is initialised as zeros and updated by layer-0 (whose vrl_alpha=0
+        # means it always outputs its own v unchanged). No None in the graph.
+        h  = tok_emb
+        v0 = torch.zeros(B, self.args.num_heads, T,
+                         self.args.model_dim // self.args.num_heads,
+                         device=device, dtype=tok_emb.dtype)
         for block in self.blocks:
             h, v0 = block(h, cos, sin, v0)
 
         h = self.norm_out(h)
 
-        if self.head is not None:
-            logits = self.head(h)
-        else:
-            # Tied embedding (optionally QAT-quantised)
-            w = self.embed.weight
-            if self.qat_enabled:
-                w = self._qat_quantise(w)
-            logits = F.linear(h, w)
+        # ── Output projection (tied embedding, optionally QAT) ─
+        w = self.embed.weight
+        if self.qat_enabled:
+            w = self._qat_quantise(w)
+        logits = F.linear(h, w)
 
-        # Logit soft-cap
+        # ── Logit soft-cap ────────────────────────────────────
         logits = torch.tanh(logits / self.logit_softcap) * self.logit_softcap
 
         if targets is None:
             return logits
-
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
 
@@ -1420,3 +1410,4 @@ def train(args: Hyperparameters):
 if __name__ == "__main__":
     args = Hyperparameters()
     train(args)
+  
