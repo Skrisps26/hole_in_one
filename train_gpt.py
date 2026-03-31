@@ -80,8 +80,18 @@ class DistributedLoader:
         start = self.rank * per_rank
         local = chunk[start:start+per_rank+1]
 
-        x = local[:-1].view(-1, seq).to(self.device, non_blocking=True)
-        y = local[1:].view(-1, seq).to(self.device, non_blocking=True)
+        tokens = local[:-1]
+        targets = local[1:]
+        
+        # trim to multiple of seq
+        usable = (tokens.numel() // seq) * seq
+        
+        tokens = tokens[:usable]
+        targets = targets[:usable]
+        
+        x = tokens.reshape(-1, seq).to(self.device, non_blocking=True)
+        y = targets.reshape(-1, seq).to(self.device, non_blocking=True)
+        
         return x, y
 
 # =============================
